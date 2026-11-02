@@ -2152,6 +2152,57 @@ void gc_heap::measure_string_duplicates()
 //   time the GC spent on the queue in microseconds, heap number,
 //   entries removed because the GC left their string in a younger generation, 1 for a background GC and 0 for a blocking GC.
 
+// The native memory of the feature: the queues, the table, the pairs and the redirections of the merge and the sets of the strings that the roots lead to are
+// allocated and freed through string_dedup_new and string_dedup_delete, which count the bytes that they hold. The small structures that hold the buffers
+// (the state of a queue, the header of the table and of a set) are not counted. The StringDedupFind event reports the bytes that are held when it is fired
+// and the most that were held since the report before it.
+static size_t string_dedup_native_held;
+
+// The most that string_dedup_native_held reached since the last report, which the threads of a server GC raise while they grow their queues. It is a pointer
+// because that is what Interlocked can compare and exchange in this width on every platform.
+static uint8_t* volatile string_dedup_native_peak;
+
+template <typename T>
+static T* string_dedup_new (size_t count)
+{
+    T* buffer = new (nothrow) T[count];
+    if (buffer != nullptr)
+    {
+        size_t bytes = count * sizeof (T);
+        size_t held = Interlocked::ExchangeAddPtr (&string_dedup_native_held, bytes) + bytes;
+        for (uint8_t* peak = string_dedup_native_peak; (size_t)peak < held; )
+        {
+            uint8_t* seen = Interlocked::CompareExchangePointer (&string_dedup_native_peak, (uint8_t*)held, peak);
+            if (seen == peak)
+            {
+                break;
+            }
+
+            peak = seen;
+        }
+    }
+
+    return buffer;
+}
+
+// 'count' is the one that string_dedup_new was given for the buffer.
+template <typename T>
+static void string_dedup_delete (T* buffer, size_t count)
+{
+    if (buffer != nullptr)
+    {
+        assert (string_dedup_native_held >= (count * sizeof (T)));
+        delete[] buffer;
+        Interlocked::ExchangeAddPtr (&string_dedup_native_held, (size_t)0 - (count * sizeof (T)));
+    }
+}
+
+// Ends the work of a GC with the strings: the peak of the next one starts at what is held now.
+static void string_dedup_native_restart_peak()
+{
+    string_dedup_native_peak = (uint8_t*)string_dedup_native_held;
+}
+
 struct string_dedup_candidate
 {
     uint8_t* obj;
@@ -2204,14 +2255,16 @@ struct string_dedup_queue_stats
 // last at the join after the plan phase checks it for the strings that the GC demoted, which needs the regions of all the heaps to have their final
 // generations. Without regions a heap decides to demote its segments by itself, so the finder is for the server GC with regions only.
 //
-// The result is reported with the StringDedupFind GC event, once for every blocking or background GC. The payload of its version 2 is these
+// The result is reported with the StringDedupFind GC event, once for every blocking or background GC. The payload of its version 3 is these
 // uint64 values in order:
 //   GC index, status (0 active, 1 inactive because the table could not be allocated), condemned generation,
 //   candidates examined, candidates skipped because the object header holds a hash code, a lock or a sync block,
 //   duplicates found, bytes of the duplicates, canonical strings added, candidates not added because the table is full,
 //   entries removed because their string died, entries removed because the GC left their string in a younger generation,
 //   entries in the table after the GC, time the GC spent on the finder in microseconds, 1 for a background GC and 0 for a blocking GC,
-//   candidates that were not examined because the time that GCStringDedupBudgetUs gives the finder was spent.
+//   candidates that were not examined because the time that GCStringDedupBudgetUs gives the finder was spent,
+//   the bytes of native memory that the feature holds when the event is fired (the pairs of the merge are still held then), the most that it held
+//   since the previous GC ended its work with the strings (see string_dedup_new).
 
 struct string_dedup_slot
 {
@@ -2506,8 +2559,8 @@ static bool string_dedup_pairs_reserve (string_dedup_queue_state* owner, size_t 
 {
     if (owner->pair_capacity < count)
     {
-        delete[] owner->pairs;
-        owner->pairs = new (nothrow) string_dedup_pair[count];
+        string_dedup_delete (owner->pairs, owner->pair_capacity);
+        owner->pairs = string_dedup_new<string_dedup_pair> (count);
         owner->pair_capacity = (owner->pairs != nullptr) ? count : 0;
     }
 
@@ -2529,7 +2582,7 @@ static bool string_dedup_queue_reserve (string_dedup_queue_state* queue)
     queue->max_capacity = string_dedup_queue_max_capacity();
     if (queue->entries == nullptr)
     {
-        queue->entries = new (nothrow) string_dedup_candidate[string_dedup_queue_base_capacity];
+        queue->entries = string_dedup_new<string_dedup_candidate> (string_dedup_queue_base_capacity);
         queue->capacity = (queue->entries != nullptr) ? string_dedup_queue_base_capacity : 0;
     }
 
@@ -2546,14 +2599,14 @@ static bool string_dedup_queue_grow (string_dedup_queue_state* queue)
     }
 
     size_t capacity = (queue->capacity < (queue->max_capacity / 2)) ? (queue->capacity * 2) : queue->max_capacity;
-    string_dedup_candidate* entries = new (nothrow) string_dedup_candidate[capacity];
+    string_dedup_candidate* entries = string_dedup_new<string_dedup_candidate> (capacity);
     if (entries == nullptr)
     {
         return false;
     }
 
     memcpy (entries, queue->entries, queue->count * sizeof (string_dedup_candidate));
-    delete[] queue->entries;
+    string_dedup_delete (queue->entries, queue->capacity);
     queue->entries = entries;
     queue->capacity = capacity;
 
@@ -2565,7 +2618,7 @@ static void string_dedup_queue_shrink (string_dedup_queue_state* queue)
 {
     if ((queue->count == 0) && (queue->capacity > string_dedup_queue_base_capacity))
     {
-        delete[] queue->entries;
+        string_dedup_delete (queue->entries, queue->capacity);
         queue->entries = nullptr;
         queue->capacity = 0;
     }
@@ -2677,14 +2730,14 @@ static bool string_dedup_table_rebuild (string_dedup_table* table, size_t capaci
     assert ((capacity >= table->live) && (capacity <= table->max_capacity));
 
     size_t slot_count = string_dedup_table_slot_count (table, capacity);
-    uint8_t** strings = new (nothrow) uint8_t*[capacity];
-    uint32_t* hashes = new (nothrow) uint32_t[capacity];
-    string_dedup_slot* slots = new (nothrow) string_dedup_slot[slot_count];
+    uint8_t** strings = string_dedup_new<uint8_t*> (capacity);
+    uint32_t* hashes = string_dedup_new<uint32_t> (capacity);
+    string_dedup_slot* slots = string_dedup_new<string_dedup_slot> (slot_count);
     if ((strings == nullptr) || (hashes == nullptr) || (slots == nullptr))
     {
-        delete[] strings;
-        delete[] hashes;
-        delete[] slots;
+        string_dedup_delete (strings, capacity);
+        string_dedup_delete (hashes, capacity);
+        string_dedup_delete (slots, slot_count);
 
         return false;
     }
@@ -2711,9 +2764,9 @@ static bool string_dedup_table_rebuild (string_dedup_table* table, size_t capaci
         }
     }
 
-    delete[] table->strings;
-    delete[] table->hashes;
-    delete[] table->slots;
+    string_dedup_delete (table->strings, table->capacity);
+    string_dedup_delete (table->hashes, table->capacity);
+    string_dedup_delete (table->slots, table->slot_count);
     table->strings = strings;
     table->hashes = hashes;
     table->slots = slots;
@@ -2901,7 +2954,7 @@ static void string_dedup_rooted_add (string_dedup_rooted_set* set, uint8_t* o)
     if ((set->count + 1) * 2 > set->slot_count)
     {
         size_t slot_count = (set->slot_count == 0) ? 1024 : (set->slot_count * 2);
-        uint8_t** slots = new (nothrow) uint8_t*[slot_count];
+        uint8_t** slots = string_dedup_new<uint8_t*> (slot_count);
         if (slots == nullptr)
         {
             set->incomplete = true;
@@ -2924,7 +2977,7 @@ static void string_dedup_rooted_add (string_dedup_rooted_set* set, uint8_t* o)
             }
         }
 
-        delete[] set->slots;
+        string_dedup_delete (set->slots, set->slot_count);
         set->slots = slots;
         set->slot_count = slot_count;
     }
@@ -2973,7 +3026,7 @@ static void string_dedup_rooted_clear (string_dedup_rooted_set* set)
 
     if (set->slot_count > ((size_t)1 << 16))
     {
-        delete[] set->slots;
+        string_dedup_delete (set->slots, set->slot_count);
         set->slots = nullptr;
         set->slot_count = 0;
     }
@@ -3210,12 +3263,12 @@ static void string_dedup_find_consume (string_dedup_queue_state* source, string_
 
 static void string_dedup_find_fire (const string_dedup_find_stats* stats, size_t table_size)
 {
-    if (!GCEventEnabledStringDedupFind_V2())
+    if (!GCEventEnabledStringDedupFind_V3())
     {
         return;
     }
 
-    GCEventFireStringDedupFind_V2 (
+    GCEventFireStringDedupFind_V3 (
         stats->gc_index,
         stats->status,
         stats->condemned_generation,
@@ -3230,7 +3283,9 @@ static void string_dedup_find_fire (const string_dedup_find_stats* stats, size_t
         (uint64_t)table_size,
         stats->elapsed_us,
         stats->background,
-        stats->skipped_budget
+        stats->skipped_budget,
+        (uint64_t)string_dedup_native_held,
+        (uint64_t)(size_t)string_dedup_native_peak
     );
 }
 
@@ -3266,15 +3321,15 @@ static bool string_dedup_redirects_create (string_dedup_redirects* map, const st
 
     if (map->slot_capacity < slot_count)
     {
-        delete[] map->slots;
-        map->slots = new (nothrow) string_dedup_pair[slot_count];
+        string_dedup_delete (map->slots, map->slot_capacity);
+        map->slots = string_dedup_new<string_dedup_pair> (slot_count);
         map->slot_capacity = (map->slots != nullptr) ? slot_count : 0;
     }
 
     if (map->filter_capacity < filter_bits)
     {
-        delete[] map->filter;
-        map->filter = new (nothrow) uint64_t[filter_bits / 64];
+        string_dedup_delete (map->filter, map->filter_capacity / 64);
+        map->filter = string_dedup_new<uint64_t> (filter_bits / 64);
         map->filter_capacity = (map->filter != nullptr) ? filter_bits : 0;
     }
 
@@ -3854,11 +3909,11 @@ void gc_heap::string_dedup_merge_end()
     // The buffers stay for the next GC that merges, unless this GC had so many duplicates that they are big.
     if (map->slot_capacity > string_dedup_redirects_keep_slots)
     {
-        delete[] map->slots;
+        string_dedup_delete (map->slots, map->slot_capacity);
         map->slots = nullptr;
         map->slot_capacity = 0;
         map->slot_count = 0;
-        delete[] map->filter;
+        string_dedup_delete (map->filter, map->filter_capacity / 64);
         map->filter = nullptr;
         map->filter_capacity = 0;
         map->filter_bits = 0;
@@ -3919,7 +3974,7 @@ void gc_heap::string_dedup_merge_report (string_dedup_queue_state* owner)
     // The pairs are given back too when this GC had so many duplicates that they are big.
     if (owner->pair_capacity > string_dedup_pairs_keep)
     {
-        delete[] owner->pairs;
+        string_dedup_delete (owner->pairs, owner->pair_capacity);
         owner->pairs = nullptr;
         owner->pair_capacity = 0;
     }
@@ -3952,6 +4007,7 @@ void gc_heap::string_dedup_queue_report()
 #endif //USE_REGIONS
             }
 
+            string_dedup_native_restart_peak();
             gc_t_join.restart();
         }
     }
@@ -4019,6 +4075,11 @@ void gc_heap::string_dedup_queue_report()
         string_dedup_merge_report (queue);
     }
 #endif //USE_REGIONS
+
+    if (string_dedup_find_enabled())
+    {
+        string_dedup_native_restart_peak();
+    }
 #endif //!MULTIPLE_HEAPS
 
     if (queued || (stats->demoted != 0))
@@ -4067,6 +4128,7 @@ void gc_heap::string_dedup_queue_background_mark()
         find.elapsed_us = GetHighPrecisionTimeStamp() - start_time;
 
         string_dedup_find_fire (&find, queue->table->live);
+        string_dedup_native_restart_peak();
     }
 }
 #endif //BACKGROUND_GC
@@ -4187,10 +4249,71 @@ static void string_dedup_table_verify (string_dedup_table* table)
     }
 }
 
+// The bytes that the buffers of a queue, of its table and of the merge, and of a set of the strings that the roots lead to, add up to.
+static size_t string_dedup_native_bytes_of (const string_dedup_queue_state* queue, const string_dedup_rooted_set* roots)
+{
+    size_t bytes = 0;
+    if (queue != nullptr)
+    {
+        bytes += queue->capacity * sizeof (string_dedup_candidate);
+        if (queue->table != nullptr)
+        {
+            bytes += (queue->table->capacity * (sizeof (uint8_t*) + sizeof (uint32_t))) + (queue->table->slot_count * sizeof (string_dedup_slot));
+        }
+
+#ifdef USE_REGIONS
+        bytes += queue->pair_capacity * sizeof (string_dedup_pair);
+        bytes += (queue->redirects.slot_capacity * sizeof (string_dedup_pair)) + ((queue->redirects.filter_capacity / 64) * sizeof (uint64_t));
+#endif //USE_REGIONS
+    }
+
+#ifdef USE_REGIONS
+    if (roots != nullptr)
+    {
+        bytes += roots->slot_count * sizeof (uint8_t*);
+    }
+#else //USE_REGIONS
+    UNREFERENCED_PARAMETER (roots);
+#endif //USE_REGIONS
+
+    return bytes;
+}
+
 // Every entry must still point at the string it was queued for, which fails when an entry was not relocated or kept after its string died,
-// and the string must be in gen2, which fails when an entry was not removed after the GC demoted its string.
+// and the string must be in gen2, which fails when an entry was not removed after the GC demoted its string. The bytes that string_dedup_new and
+// string_dedup_delete count must be the ones of the buffers that all the heaps have.
 void gc_heap::string_dedup_queue_verify()
 {
+#ifdef MULTIPLE_HEAPS
+    if (heap_number == 0)
+    {
+        size_t bytes = 0;
+        for (int i = 0; i < n_max_heaps; i++)
+        {
+#ifdef USE_REGIONS
+            bytes += string_dedup_native_bytes_of (g_heaps[i]->string_dedup_queue, g_heaps[i]->string_dedup_roots);
+#else //USE_REGIONS
+            bytes += string_dedup_native_bytes_of (g_heaps[i]->string_dedup_queue, nullptr);
+#endif //USE_REGIONS
+        }
+
+        if (bytes != string_dedup_native_held)
+        {
+            FATAL_GC_ERROR();
+        }
+    }
+#else //MULTIPLE_HEAPS
+#ifdef USE_REGIONS
+    size_t bytes = string_dedup_native_bytes_of (string_dedup_queue, string_dedup_roots);
+#else //USE_REGIONS
+    size_t bytes = string_dedup_native_bytes_of (string_dedup_queue, nullptr);
+#endif //USE_REGIONS
+    if (bytes != string_dedup_native_held)
+    {
+        FATAL_GC_ERROR();
+    }
+#endif //MULTIPLE_HEAPS
+
     string_dedup_queue_state* queue = string_dedup_queue;
     if (queue == nullptr)
     {
