@@ -2381,7 +2381,6 @@ struct string_dedup_pair
     uint8_t* duplicate;
     uint8_t* canonical;  // where the canonical string is going to be after the GC, nullptr for a pair that was dropped
     size_t bytes;        // the size of the duplicate
-    size_t references;   // the references to the duplicate that the relocate phase replaced
 };
 
 struct string_dedup_merge_stats
@@ -2403,20 +2402,68 @@ struct string_dedup_merge_stats
     uint64_t upgraded;
     uint64_t bgc;
     uint64_t bgc_marked;
+    uint64_t registered_bytes; // not in the event: merged_bytes is this, because every registered duplicate is referenced (unreferenced is 0)
 };
 
-// What relocate_address looks at while the merge is active: the registered pairs in an open addressing table that is two thirds full at most, a pair
-// in the slot that the address of its duplicate leads to (an empty slot has no duplicate), so that finding a pair takes one cache line, and a filter with
-// 16 bits for every pair, which tells most other addresses apart with one load.
+// What relocate_address looks at while the merge is active: the registered duplicates in an open addressing table that is two thirds full at most, a slot with a
+// duplicate and its canonical string in the slot that the address of the duplicate leads to (an empty slot has no duplicate), so that finding one takes one cache
+// line, and a filter with 16 bits for every duplicate, which tells most other addresses apart with one load.
+struct string_dedup_redirect_slot
+{
+    uint8_t* duplicate;
+    uint8_t* canonical; // where the canonical string is after the GC, its lowest bit is set once a reference to the duplicate has been replaced (strings are aligned)
+};
+
 struct string_dedup_redirects
 {
-    string_dedup_pair* slots;
+    string_dedup_redirect_slot* slots;
     size_t slot_count;
     size_t slot_capacity; // what is allocated, the buffers are kept for the next GC that merges
     uint64_t* filter;
     size_t filter_bits;   // a power of two
     size_t filter_capacity;
 };
+
+// The references that the relocate phase replaced. The threads of a server GC count them with atomic additions on one of a few counters that the address of the
+// reference leads to (a counter for every 128 bytes of address space), each in a cache line of its own (128 bytes, the line of the CPUs of Apple), so that they do
+// not all write to the same one.
+#ifdef MULTIPLE_HEAPS
+const size_t string_dedup_counter_stripes = 16;
+
+struct string_dedup_counter
+{
+    size_t value;
+    uint8_t padding[128 - sizeof (size_t)];
+};
+
+static string_dedup_counter string_dedup_replaced[string_dedup_counter_stripes];
+#else //MULTIPLE_HEAPS
+static size_t string_dedup_replaced;
+#endif //MULTIPLE_HEAPS
+
+static void string_dedup_replaced_reset()
+{
+#ifdef MULTIPLE_HEAPS
+    memset (string_dedup_replaced, 0, sizeof (string_dedup_replaced));
+#else //MULTIPLE_HEAPS
+    string_dedup_replaced = 0;
+#endif //MULTIPLE_HEAPS
+}
+
+static size_t string_dedup_replaced_total()
+{
+#ifdef MULTIPLE_HEAPS
+    size_t total = 0;
+    for (size_t i = 0; i < string_dedup_counter_stripes; i++)
+    {
+        total += string_dedup_replaced[i].value;
+    }
+
+    return total;
+#else //MULTIPLE_HEAPS
+    return string_dedup_replaced;
+#endif //MULTIPLE_HEAPS
+}
 
 // The buffers of the pairs and of the redirections are kept for the next GC that merges, unless a GC with very many duplicates made them bigger than this.
 const size_t string_dedup_pairs_keep = (size_t)1 << 16;
@@ -3065,7 +3112,7 @@ static void string_dedup_pair_add (string_dedup_queue_state* owner, uint8_t* dup
     }
 
     assert (owner->pair_count < owner->pair_capacity);
-    owner->pairs[owner->pair_count++] = string_dedup_pair { duplicate, canonical, bytes, 0 };
+    owner->pairs[owner->pair_count++] = string_dedup_pair { duplicate, canonical, bytes };
     owner->merge.pairs++;
     owner->merge.pair_bytes += bytes;
 }
@@ -3322,7 +3369,7 @@ static bool string_dedup_redirects_create (string_dedup_redirects* map, const st
     if (map->slot_capacity < slot_count)
     {
         string_dedup_delete (map->slots, map->slot_capacity);
-        map->slots = string_dedup_new<string_dedup_pair> (slot_count);
+        map->slots = string_dedup_new<string_dedup_redirect_slot> (slot_count);
         map->slot_capacity = (map->slots != nullptr) ? slot_count : 0;
     }
 
@@ -3338,7 +3385,7 @@ static bool string_dedup_redirects_create (string_dedup_redirects* map, const st
         return false;
     }
 
-    memset (map->slots, 0, slot_count * sizeof (string_dedup_pair));
+    memset (map->slots, 0, slot_count * sizeof (string_dedup_redirect_slot));
     memset (map->filter, 0, filter_bits / 8);
     map->slot_count = slot_count;
     map->filter_bits = filter_bits;
@@ -3364,7 +3411,8 @@ static bool string_dedup_redirects_create (string_dedup_redirects* map, const st
             index = (index + 1 == slot_count) ? 0 : (index + 1);
         }
 
-        map->slots[index] = pairs[i];
+        map->slots[index].duplicate = pairs[i].duplicate;
+        map->slots[index].canonical = pairs[i].canonical;
 
         size_t bit = string_dedup_redirect_filter_bit (pairs[i].duplicate, filter_bits);
         map->filter[bit / 64] |= (uint64_t)1 << (bit % 64);
@@ -3373,8 +3421,8 @@ static bool string_dedup_redirects_create (string_dedup_redirects* map, const st
     return true;
 }
 
-// The pair of a registered duplicate, nullptr for any other address.
-static inline string_dedup_pair* string_dedup_redirects_find (const string_dedup_redirects* map, uint8_t* o)
+// The slot of a registered duplicate, nullptr for any other address.
+static inline string_dedup_redirect_slot* string_dedup_redirects_find (const string_dedup_redirects* map, uint8_t* o)
 {
     size_t bit = string_dedup_redirect_filter_bit (o, map->filter_bits);
     if ((map->filter[bit / 64] & ((uint64_t)1 << (bit % 64))) == 0)
@@ -3823,6 +3871,7 @@ void gc_heap::string_dedup_merge_begin()
         if (canonical != nullptr)
         {
             registered++;
+            stats->registered_bytes += pair->bytes;
         }
         else
         {
@@ -3837,10 +3886,12 @@ void gc_heap::string_dedup_merge_begin()
         {
             stats->status = 3;
             stats->registered = 0;
+            stats->registered_bytes = 0;
         }
         else
         {
             // From now on relocate_address replaces the references to the registered duplicates.
+            string_dedup_replaced_reset();
             string_dedup_redirect_map = &queue->redirects;
         }
     }
@@ -3851,18 +3902,24 @@ void gc_heap::string_dedup_merge_begin()
 // Called by relocate_address for every reference that it relocates while the merge is active. Returns true when it replaced the reference.
 bool gc_heap::string_dedup_redirect (uint8_t** pold_address)
 {
-    string_dedup_pair* pair = string_dedup_redirects_find (string_dedup_redirect_map, *pold_address);
-    if (pair == nullptr)
+    string_dedup_redirect_slot* slot = string_dedup_redirects_find (string_dedup_redirect_map, *pold_address);
+    if (slot == nullptr)
     {
         return false;
     }
 
-    *pold_address = pair->canonical;
+    size_t canonical = (size_t)slot->canonical;
+    *pold_address = (uint8_t*)(canonical & ~(size_t)1);
+    if ((canonical & 1) == 0)
+    {
+        // The threads of a server GC that are the first to replace a reference to the duplicate all store the same value.
+        slot->canonical = (uint8_t*)(canonical | 1);
+    }
+
 #ifdef MULTIPLE_HEAPS
-    // The threads of all the heaps replace references, and any of them can find one to the same duplicate.
-    Interlocked::ExchangeAddPtr (&pair->references, (size_t)1);
+    Interlocked::ExchangeAddPtr (&string_dedup_replaced[((size_t)pold_address >> 7) & (string_dedup_counter_stripes - 1)].value, (size_t)1);
 #else //MULTIPLE_HEAPS
-    pair->references++;
+    string_dedup_replaced++;
 #endif //MULTIPLE_HEAPS
 
     return true;
@@ -3886,17 +3943,15 @@ void gc_heap::string_dedup_merge_end()
 
     for (size_t i = 0; i < map->slot_count; i++)
     {
-        string_dedup_pair* pair = &map->slots[i];
-        if (pair->duplicate == nullptr)
+        string_dedup_redirect_slot* slot = &map->slots[i];
+        if (slot->duplicate == nullptr)
         {
             continue;
         }
 
-        if (pair->references != 0)
+        if (((size_t)slot->canonical & 1) != 0)
         {
             stats->merged++;
-            stats->merged_bytes += pair->bytes;
-            stats->references += pair->references;
         }
         else
         {
@@ -3904,6 +3959,9 @@ void gc_heap::string_dedup_merge_end()
         }
     }
 
+    // A duplicate without a reference is a failure that the reader reports, so the size of the registered duplicates is what was merged.
+    stats->merged_bytes = stats->registered_bytes;
+    stats->references = string_dedup_replaced_total();
     stats->elapsed_us += GetHighPrecisionTimeStamp() - start_time;
 
     // The buffers stay for the next GC that merges, unless this GC had so many duplicates that they are big.
@@ -4263,7 +4321,7 @@ static size_t string_dedup_native_bytes_of (const string_dedup_queue_state* queu
 
 #ifdef USE_REGIONS
         bytes += queue->pair_capacity * sizeof (string_dedup_pair);
-        bytes += (queue->redirects.slot_capacity * sizeof (string_dedup_pair)) + ((queue->redirects.filter_capacity / 64) * sizeof (uint64_t));
+        bytes += (queue->redirects.slot_capacity * sizeof (string_dedup_redirect_slot)) + ((queue->redirects.filter_capacity / 64) * sizeof (uint64_t));
 #endif //USE_REGIONS
     }
 
