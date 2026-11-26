@@ -43,6 +43,13 @@ relocation of references), `background.cpp` and `interface.cpp` (background GC
 marking and the roots that a stack holds), `dynamic_heap_count.cpp` (DATAS) and
 `diagnostics.cpp` (heap verification). The members are declared in `gcpriv.h`.
 
+## Tests
+
+`src/tests/GC/Features/StringDedup` runs the merge with workstation and with
+server GC: 100,000 strings with 1,000 different contents have to become at most
+a tenth of that many objects (1,000 in the runs so far) with their contents
+intact, and strings that have a hash code have to stay separate objects.
+
 ## Known limits
 
 - The merge needs regions, so 64-bit and not the segments GC.

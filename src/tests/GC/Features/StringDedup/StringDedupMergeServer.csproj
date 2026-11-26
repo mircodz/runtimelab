@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <!-- Needed for CLRTestEnvironmentVariable, CLRTestTargetUnsupported, and GCStressIncompatible -->
+    <RequiresProcessIsolation>true</RequiresProcessIsolation>
+    <!-- Native AOT will only compile in the server GC if this is set -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <!-- The merge is a feature of the CoreCLR GC with regions, which a 32-bit process does not use -->
+    <CLRTestTargetUnsupported Condition="'$(RuntimeFlavor)' != 'coreclr' or '$(TargetArchitecture)' == 'arm' or '$(TargetArchitecture)' == 'x86' or '$(TargetArchitecture)' == 'wasm'">true</CLRTestTargetUnsupported>
+    <!-- Server GC is disabled on CoreCLR browser by design -->
+    <CLRTestTargetUnsupported Condition="'$(TargetOS)' == 'browser'">true</CLRTestTargetUnsupported>
+    <!-- The test counts what its own GCs leave, which GCStress changes -->
+    <GCStressIncompatible>true</GCStressIncompatible>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="StringDedupMerge.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(TestLibraryProjectPath)" />
+  </ItemGroup>
+  <ItemGroup>
+    <CLRTestEnvironmentVariable Include="DOTNET_gcServer" Value="1" />
+    <CLRTestEnvironmentVariable Include="DOTNET_GCStringDedupMerge" Value="1" />
+  </ItemGroup>
+</Project>
