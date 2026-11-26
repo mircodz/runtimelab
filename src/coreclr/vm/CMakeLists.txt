@@ -1189,6 +1189,7 @@ set(GC_WKS_SVR_SOURCES
     ../gc/sweep.cpp
     ../gc/collect.cpp
     ../gc/diagnostics.cpp
+    ../gc/string_dedup.cpp
     ../gc/dynamic_heap_count.cpp
     ../gc/card_table.cpp
     ../gc/relocate_compact.cpp

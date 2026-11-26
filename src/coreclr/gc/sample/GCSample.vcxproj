@@ -107,6 +107,7 @@
     <ClCompile Include="..\sweep.cpp" />
     <ClCompile Include="..\collect.cpp" />
     <ClCompile Include="..\diagnostics.cpp" />
+    <ClCompile Include="..\string_dedup.cpp" />
     <ClCompile Include="..\dynamic_heap_count.cpp" />
     <ClCompile Include="..\card_table.cpp" />
     <ClCompile Include="..\relocate_compact.cpp" />

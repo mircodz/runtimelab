@@ -12,6 +12,7 @@ set(GC_WKS_SVR_SOURCES
     ${GC_DIR}/sweep.cpp
     ${GC_DIR}/collect.cpp
     ${GC_DIR}/diagnostics.cpp
+    ${GC_DIR}/string_dedup.cpp
     ${GC_DIR}/dynamic_heap_count.cpp
     ${GC_DIR}/card_table.cpp
     ${GC_DIR}/relocate_compact.cpp

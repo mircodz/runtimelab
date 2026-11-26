@@ -124,6 +124,7 @@ set(GC_WKS_SVR_SOURCES
   sweep.cpp
   collect.cpp
   diagnostics.cpp
+  string_dedup.cpp
   dynamic_heap_count.cpp
   card_table.cpp
   relocate_compact.cpp
