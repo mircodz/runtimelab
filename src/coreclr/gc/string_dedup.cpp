@@ -11,6 +11,28 @@ namespace WKS
 {
 #endif // SERVER_GC
 
+// String deduplication, an opt-in experiment whose settings are the GCStringDedup* entries of gcconfig.h. This file holds all of it, the rest of the
+// GC calls into it from a few places: collect.cpp (after mark and after plan), plan_phase.cpp (the decision to compact), relocate_compact.cpp (the
+// relocate phase and every relocated reference), background.cpp (the final mark of a background GC), interface.cpp (the roots on a stack),
+// dynamic_heap_count.cpp (DATAS) and diagnostics.cpp (heap verification).
+//
+// What a GC does, in order:
+//   measure  gc_heap::measure_string_duplicates: a workstation GC that condemns gen2 counts the duplicates of the heap and fires an event, it changes nothing.
+//   queue    string_dedup_queue_after_mark: right after marking in a blocking GC that condemns gen1, the marked strings of gen1 become candidates when the
+//            GC promotes them, unless they are pinned or their header holds a hash code, a lock or a sync block. A string leaves gen1 once, so it is a
+//            candidate once.
+//   find     string_dedup_find_after_mark, called by the same function: hashes the candidates and looks them up in a table of the strings of gen2. A string
+//            that is not in the table becomes the canonical string of its content, any other string is a duplicate of the canonical one. The time
+//            (GCStringDedupBudgetUs) and the size of the table (GCStringDedupFindTableBits) are limited.
+//   merge    (regions only, in a GC that compacts) string_dedup_merge_begin registers the duplicates at the start of the relocate phase,
+//            string_dedup_redirect replaces every reference to one while gc_heap::relocate_address relocates it, string_dedup_merge_end drops the
+//            registrations. string_dedup_compaction_pays makes a gen1 GC that would sweep compact when the duplicates that it found are worth enough.
+//   report   string_dedup_queue_report, after the plan phase: removes the strings that the GC left in a younger generation from the table and fires the events.
+//
+// Between these, string_dedup_queue_relocate follows the entries of the queue and the strings of the table when the GC compacts, string_dedup_queue_background_mark
+// removes the ones that die in a background GC, and string_dedup_queue_merge moves the queue of a heap that DATAS removes to another heap. The finder leaves a
+// string alone when a stack, a register or a byref refers to it (string_dedup_note_root), because it can be under construction.
+
 #ifdef FEATURE_EVENT_TRACE
 
 // The GC does not know the string method table, so strings are recognized by their shape: a variable sized object with two byte

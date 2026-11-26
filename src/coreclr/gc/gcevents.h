@@ -53,13 +53,13 @@ DYNAMIC_EVENT(CommittedUsage, GCEventLevel_Information, GCEventKeyword_GC, 1)
 DYNAMIC_EVENT(SizeAdaptationTuning, GCEventLevel_Information, GCEventKeyword_GC, 1)
 DYNAMIC_EVENT(SizeAdaptationFullGCTuning, GCEventLevel_Information, GCEventKeyword_GC, 1)
 DYNAMIC_EVENT(SizeAdaptationSample, GCEventLevel_Information, GCEventKeyword_GC, 1)
-// The payload of StringDedupMeasure is described at gc_heap::measure_string_duplicates in diagnostics.cpp.
+// The payload of StringDedupMeasure is described at gc_heap::measure_string_duplicates in string_dedup.cpp.
 DYNAMIC_EVENT(StringDedupMeasure, GCEventLevel_Information, GCEventKeyword_GC, 1)
-// The payload of StringDedupQueue is described at the candidate queue in diagnostics.cpp.
+// The payload of StringDedupQueue is described at the candidate queue in string_dedup.cpp.
 DYNAMIC_EVENT(StringDedupQueue, GCEventLevel_Information, GCEventKeyword_GC, 3)
-// The payload of StringDedupFind is described at the finder in diagnostics.cpp.
+// The payload of StringDedupFind is described at the finder in string_dedup.cpp.
 DYNAMIC_EVENT(StringDedupFind, GCEventLevel_Information, GCEventKeyword_GC, 3)
-// The payload of StringDedupMerge is described at the merge in diagnostics.cpp.
+// The payload of StringDedupMerge is described at the merge in string_dedup.cpp.
 DYNAMIC_EVENT(StringDedupMerge, GCEventLevel_Information, GCEventKeyword_GC, 3)
 
 #undef KNOWN_EVENT
