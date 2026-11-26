@@ -1,3 +1,63 @@
+# GC string deduplication
+
+An experiment on top of [`feature/gc/baseline`](https://github.com/dotnet/runtimelab/tree/feature/gc/baseline):
+the GC finds strings with the same contents and, opt-in, merges them, so
+duplicates are reclaimed without any change to user code.
+
+- **Queue:** strings that leave gen1 become candidates; a string is examined once.
+- **Find:** after mark, the candidates are hashed and compared to find duplicates
+  without touching the heap. A time budget and a table size limit bound the work.
+- **Merge:** a compacting GC (or a background GC) points every reference to a
+  duplicate at one canonical string; the next gen2 GC reclaims the duplicates.
+  A gen1 GC that would sweep compacts instead when enough duplicates were found.
+- **Measure:** a full blocking GC can report how much deduplication would save,
+  without changing anything.
+
+Strings whose identity is observable (hash code, lock or sync block in the
+header) and pinned strings are left alone. With server GC, finding and
+merging need regions; merging always does.
+
+Everything is off by default. The settings (`DOTNET_` + name, values in hex):
+
+| Setting | Default | What it does |
+|---|---|---|
+| `GCStringDedupMeasure` | 0 | Measure the potential in full blocking GCs (workstation GC) |
+| `GCStringDedupQueue` | 0 | Queue candidates |
+| `GCStringDedupFind` | 0 | Find duplicates among them; implies Queue |
+| `GCStringDedupMerge` | 0 | Merge what was found; implies Find (regions only) |
+| `GCStringDedupQueueMax` | 0x100000 | Most candidates a heap queues per GC |
+| `GCStringDedupBudgetUs` | 0 | Most microseconds the finder spends per GC; 0 is no limit |
+| `GCStringDedupFindTableBits` | 0x15 | Finder table holds 3/4 of 2^N strings (N 12 to 24) |
+| `GCStringDedupCompactMinKB` | 0x40 | Duplicate KB that make a sweeping gen1 GC compact; 0 never |
+
+Each stage reports a GC event (`StringDedupMeasure`, `StringDedupQueue`,
+`StringDedupFind`, `StringDedupMerge`); the payloads are described in
+`src/coreclr/gc/string_dedup.cpp`.
+
+## Where the code is
+
+All of the feature is in `src/coreclr/gc/string_dedup.cpp`. The rest of the GC
+calls into it from a few places: `collect.cpp` (after mark and after plan),
+`plan_phase.cpp` (the decision to compact), `relocate_compact.cpp` (the
+relocation of references), `background.cpp` and `interface.cpp` (background GC
+marking and the roots that a stack holds), `dynamic_heap_count.cpp` (DATAS) and
+`diagnostics.cpp` (heap verification). The members are declared in `gcpriv.h`.
+
+## Known limits
+
+- The merge needs regions, so 64-bit and not the segments GC.
+- With server GC, a GC that overlaps a background GC merges nothing.
+- A merged string is one object for every reference to it: code that relies on
+  the identity of two equal strings, or that changes a string in place, can
+  observe it. That is why the feature is opt-in.
+- Built and tested on macOS arm64 only; Windows, Linux, x86 and NativeAOT are
+  not tested.
+
+The NuGet prerelease label is **`gcdedup`**. Standard runtime package IDs are
+unchanged.
+
+The rest of this file is the baseline's.
+
 # GC baseline
 
 A runtime-side baseline for running runtimelab GC experiments with
@@ -8,10 +68,6 @@ the workloads and runner that exercise those runtimes.
 `feature/gc/baseline` starts from `dotnet/runtime` commit
 `f92f93994a587f69d6f7510d5390e68bd5290b2b`. It includes the full runtime source
 and runtimelab publishing setup, with no experimental GC changes.
-
-The NuGet prerelease label is **`gcbase`**. Standard runtime package IDs are
-unchanged. Future experiments must use a different unique label of at most
-seven characters.
 
 ## Build and publish
 
